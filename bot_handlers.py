@@ -14,14 +14,23 @@ from telegram.ext import (
 
 import database
 import gemini_service
+import google_calendar_service
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 PRIORITY_LABEL = {"high": "Високий", "medium": "Середній", "low": "Низький"}
 
 
+def _esc(text: str) -> str:
+    if not text:
+        return ""
+    for ch in r"_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _format_tasks(tasks: list[dict], transcript: str) -> str:
     lines = [
-        f"📝 *Транскрипт:*\n_{transcript}_\n",
+        f"📝 *Транскрипт:*\n_{_esc(transcript)}_\n",
         f"*Знайдено задач: {len(tasks)}*\n",
     ]
     for i, t in enumerate(tasks, 1):
@@ -38,19 +47,17 @@ def _format_tasks(tasks: list[dict], transcript: str) -> str:
     return "\n".join(lines)
 
 
-def _esc(text: str) -> str:
-    """Escape MarkdownV2 special characters."""
-    for ch in r"_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
 def _confirmation_keyboard(session_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Підтвердити", callback_data=f"confirm:{session_key}"),
-        InlineKeyboardButton("✏️ Уточнити", callback_data=f"clarify:{session_key}"),
-        InlineKeyboardButton("❌ Скасувати", callback_data=f"cancel:{session_key}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Підтвердити", callback_data=f"confirm:{session_key}"),
+            InlineKeyboardButton("📅 + Calendar", callback_data=f"calendar:{session_key}"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Уточнити", callback_data=f"clarify:{session_key}"),
+            InlineKeyboardButton("❌ Скасувати", callback_data=f"cancel:{session_key}"),
+        ],
+    ])
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -87,6 +94,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎙️ Обробляю голосове повідомлення…")
+    tmp_path = None
 
     try:
         file = await context.bot.get_file(update.message.voice.file_id)
@@ -95,7 +103,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
 
         await file.download_to_drive(tmp_path)
-
         result = await gemini_service.process_voice_message(tmp_path)
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -123,8 +130,52 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        Path(tmp_path).unlink(missing_ok=True) if "tmp_path" in locals() else None
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
         await msg.edit_text(f"❌ Помилка: {e}")
+
+
+async def _finalize_calendar(message, context: ContextTypes.DEFAULT_TYPE, flow: dict):
+    """Create Calendar events and Tasks for all collected dates."""
+    tasks_with_dates = [
+        {"task": flow["tasks"][i], "date": flow["dates"][i]}
+        for i in range(len(flow["tasks"]))
+        if i in flow["dates"]
+    ]
+
+    skipped = len(flow["tasks"]) - len(tasks_with_dates)
+
+    try:
+        links = await google_calendar_service.add_to_calendar(tasks_with_dates)
+        text = f"📅 Додано до Google Calendar та Tasks: *{len(links)}* задач\\(и\\)\\!"
+        if skipped:
+            text += f"\nПропущено \\(без дати\\): {skipped}"
+        await message.reply_text(text, parse_mode="MarkdownV2")
+    except FileNotFoundError:
+        await message.reply_text(
+            "❌ Файл `credentials\\.json` не знайдено\\.\n"
+            "Налаштуйте Google Calendar API \\(інструкція в README\\)\\.",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Помилка Calendar: {_esc(str(e))}", parse_mode="MarkdownV2")
+    finally:
+        context.user_data.pop("calendar_flow", None)
+
+
+async def _ask_next_date(message, flow: dict):
+    """Ask user for the next missing deadline."""
+    queue = flow["no_deadline_queue"]
+    idx = flow["current_queue_idx"]
+    task_title = _esc(flow["tasks"][queue[idx]]["title"])
+    total = len(queue)
+    current = idx + 1
+    await message.reply_text(
+        f"📅 Задача {current}/{total}: *{task_title}*\n"
+        "Вкажіть дату \\(наприклад: `5 червня`, `завтра`, `2024\\-06\\-05`\\)\n"
+        "або напишіть `пропустити`\\.",
+        parse_mode="MarkdownV2",
+    )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,7 +193,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vm_id = database.save_voice_message(pending["message_id"], pending["transcript"])
         count = len(database.save_tasks(vm_id, pending["tasks"]))
         del context.user_data["pending"][session_key]
-        await query.edit_message_text(f"✅ Збережено {count} задач\\(и\\)\\!", parse_mode="MarkdownV2")
+        await query.edit_message_text(
+            f"✅ Збережено {count} задач\\(и\\)\\!", parse_mode="MarkdownV2"
+        )
+
+    elif action == "calendar":
+        tasks = pending["tasks"]
+
+        # Save to DB
+        vm_id = database.save_voice_message(pending["message_id"], pending["transcript"])
+        database.save_tasks(vm_id, tasks)
+        del context.user_data["pending"][session_key]
+
+        await query.edit_message_text(
+            "✅ Збережено в БД\\. Парсю дати для Calendar…", parse_mode="MarkdownV2"
+        )
+
+        flow = {
+            "tasks": tasks,
+            "dates": {},
+            "no_deadline_queue": [],
+            "current_queue_idx": 0,
+        }
+
+        # Parse deadlines that are already mentioned
+        for i, task in enumerate(tasks):
+            if task.get("deadline"):
+                try:
+                    date = await google_calendar_service.parse_deadline_to_date(
+                        task["deadline"], gemini_service._model
+                    )
+                    flow["dates"][i] = date
+                except Exception:
+                    flow["no_deadline_queue"].append(i)
+            else:
+                flow["no_deadline_queue"].append(i)
+
+        context.user_data["calendar_flow"] = flow
+
+        if flow["no_deadline_queue"]:
+            await _ask_next_date(query.message, flow)
+        else:
+            await _finalize_calendar(query.message, context, flow)
 
     elif action == "clarify":
         context.user_data["clarify_session"] = session_key
@@ -154,34 +246,63 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session_key = context.user_data.get("clarify_session")
-    if not session_key:
+    # Clarification flow
+    if "clarify_session" in context.user_data:
+        session_key = context.user_data.pop("clarify_session")
+        pending = context.user_data.get("pending", {}).get(session_key)
+        if not pending:
+            await update.message.reply_text("❌ Сесія не знайдена.")
+            return
+
+        msg = await update.message.reply_text("🔄 Оновлюю задачі…")
+        try:
+            result = await gemini_service.reprocess_with_clarification(
+                pending["transcript"], pending["tasks"], update.message.text
+            )
+            tasks = result.get("tasks", [])
+            context.user_data["pending"][session_key]["tasks"] = tasks
+            await msg.edit_text(
+                _format_tasks(tasks, pending["transcript"]),
+                parse_mode="MarkdownV2",
+                reply_markup=_confirmation_keyboard(session_key),
+            )
+        except Exception as e:
+            context.user_data.setdefault("clarify_session", session_key)  # restore on error
+            await msg.edit_text(f"❌ Помилка: {e}")
         return
 
-    pending = context.user_data.get("pending", {}).get(session_key)
-    if not pending:
-        await update.message.reply_text("❌ Сесія не знайдена.")
-        context.user_data.pop("clarify_session", None)
-        return
+    # Calendar date collection flow
+    if "calendar_flow" in context.user_data:
+        flow = context.user_data["calendar_flow"]
+        queue = flow["no_deadline_queue"]
+        idx = flow["current_queue_idx"]
 
-    msg = await update.message.reply_text("🔄 Оновлюю задачі…")
+        if idx >= len(queue):
+            context.user_data.pop("calendar_flow", None)
+            return
 
-    try:
-        result = await gemini_service.reprocess_with_clarification(
-            pending["transcript"], pending["tasks"], update.message.text
-        )
-        tasks = result.get("tasks", [])
-        context.user_data["pending"][session_key]["tasks"] = tasks
-        context.user_data.pop("clarify_session", None)
+        user_input = update.message.text.strip().lower()
 
-        await msg.edit_text(
-            _format_tasks(tasks, pending["transcript"]),
-            parse_mode="MarkdownV2",
-            reply_markup=_confirmation_keyboard(session_key),
-        )
+        if user_input != "пропустити":
+            try:
+                date = await google_calendar_service.parse_deadline_to_date(
+                    update.message.text, gemini_service._model
+                )
+                flow["dates"][queue[idx]] = date
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Не вдалося розпізнати дату\\. Спробуйте ще раз\n"
+                    "\\(наприклад: `5 червня`, `2024\\-06\\-05`\\)\\.",
+                    parse_mode="MarkdownV2",
+                )
+                return
 
-    except Exception as e:
-        await msg.edit_text(f"❌ Помилка: {e}")
+        flow["current_queue_idx"] += 1
+
+        if flow["current_queue_idx"] < len(queue):
+            await _ask_next_date(update.message, flow)
+        else:
+            await _finalize_calendar(update.message, context, flow)
 
 
 def create_application() -> Application:
