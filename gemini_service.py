@@ -1,10 +1,26 @@
 import asyncio
 import json
 import re
+import time
 
 import google.generativeai as genai
 
 _model = None
+
+
+def _with_retry(func, *args, max_retries=3):
+    """Retry on 429 quota errors with delay extracted from the error message."""
+    for attempt in range(max_retries):
+        try:
+            return func(*args)
+        except Exception as e:
+            msg = str(e)
+            if ("429" in msg or "quota" in msg.lower()) and attempt < max_retries - 1:
+                delay_match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", msg)
+                delay = int(delay_match.group(1)) + 2 if delay_match else 20 * (attempt + 1)
+                time.sleep(delay)
+            else:
+                raise
 
 EXTRACT_PROMPT = """Transcribe this voice message and extract all tasks from it.
 The message may be in Ukrainian, Russian, English, or a mix of languages.
@@ -61,7 +77,7 @@ Apply the clarification and return updated tasks as ONLY valid JSON, no extra te
 def init_gemini(api_key: str):
     global _model
     genai.configure(api_key=api_key)
-    _model = genai.GenerativeModel("gemini-1.5-flash")
+    _model = genai.GenerativeModel("gemini-2.0-flash")
 
 
 def _parse_json(text: str) -> dict:
@@ -74,7 +90,7 @@ def _parse_json(text: str) -> dict:
 def _process_voice_sync(audio_path: str) -> dict:
     uploaded = genai.upload_file(audio_path)
     try:
-        response = _model.generate_content([uploaded, EXTRACT_PROMPT])
+        response = _with_retry(_model.generate_content, [uploaded, EXTRACT_PROMPT])
         return _parse_json(response.text)
     finally:
         uploaded.delete()
@@ -86,7 +102,7 @@ def _reprocess_sync(transcript: str, current_tasks: list, clarification: str) ->
         tasks=json.dumps(current_tasks, ensure_ascii=False, indent=2),
         clarification=clarification,
     )
-    response = _model.generate_content(prompt)
+    response = _with_retry(_model.generate_content, prompt)
     return _parse_json(response.text)
 
 

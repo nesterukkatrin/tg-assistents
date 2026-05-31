@@ -44,7 +44,8 @@ def _parse_date_sync(deadline_str: str, model) -> str:
         f'Convert this deadline to ISO date format (YYYY-MM-DD): "{deadline_str}"\n'
         "Return ONLY the date string, nothing else. Example: 2024-06-05"
     )
-    response = model.generate_content(prompt)
+    from gemini_service import _with_retry
+    response = _with_retry(model.generate_content, prompt)
     text = response.text.strip()
     match = re.search(r"\d{4}-\d{2}-\d{2}", text)
     if match:
